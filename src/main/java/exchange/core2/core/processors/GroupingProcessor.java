@@ -45,9 +45,12 @@ public final class GroupingProcessor implements EventProcessor {
     private final WaitSpinningHelper waitSpinningHelper;
     private final Sequence sequence = new Sequence(Sequencer.INITIAL_CURSOR_VALUE);
 
+    // a pool for trade event storage (?)
     private final SharedPool sharedPool;
 
+    // limit of messages in group
     private final int msgsInGroupLimit;
+    // maximum duration of group in nanoseconds
     private final long maxGroupDurationNs;
 
     public GroupingProcessor(RingBuffer<OrderCommand> ringBuffer,
@@ -114,12 +117,19 @@ public final class GroupingProcessor implements EventProcessor {
     private void processEvents() {
         long nextSequence = sequence.get() + 1L;
 
+        // group id
         long groupCounter = 0;
+        // number of messages in the current group
         long msgsInGroup = 0;
 
+        // time to switch group (when message is not big enough and already waited for a while)
+        // when idle, will check this time to decide whether to switch group or not
+        // when busy, only switch group if message in group >= msgsInGroupLimit
         long groupLastNs = 0;
 
+        // the time to mark triggerL2DataRequest to true
         long l2dataLastNs = 0;
+        // a true flag will trigger updating cmd serviceFlags to 1
         boolean triggerL2DataRequest = false;
 
         final int tradeEventChainLengthTarget = sharedPool.getChainLength();
@@ -135,18 +145,22 @@ public final class GroupingProcessor implements EventProcessor {
                 // should spin and also check another barrier
                 long availableSequence = waitSpinningHelper.tryWaitFor(nextSequence);
 
+                // handling when nextSequence is available
                 if (nextSequence <= availableSequence) {
+                    // handle each command that is available in the ring buffer
                     while (nextSequence <= availableSequence) {
 
                         final OrderCommand cmd = ringBuffer.get(nextSequence);
 
                         nextSequence++;
 
+                        // handle GROUPING_CONTROL command type for enabling/disabling grouping
                         if (cmd.command == OrderCommandType.GROUPING_CONTROL) {
                             groupingEnabled = cmd.orderId == 1;
                             cmd.resultCode = CommandResultCode.SUCCESS;
                         }
 
+                        // skip handling if grouping is disabled
                         if (!groupingEnabled) {
                             // TODO pooling
                             cmd.matcherEvent = null;
@@ -155,6 +169,7 @@ public final class GroupingProcessor implements EventProcessor {
                         }
 
                         // some commands should trigger R2 stage to avoid unprocessed events that could affect accounting state
+                        // directly switch group if command is RESET, PERSIST_STATE_MATCHING or GROUPING_CONTROL
                         if (cmd.command == OrderCommandType.RESET
                                 || cmd.command == OrderCommandType.PERSIST_STATE_MATCHING
                                 || cmd.command == OrderCommandType.GROUPING_CONTROL) {
@@ -163,14 +178,16 @@ public final class GroupingProcessor implements EventProcessor {
                         }
 
                         // report/binary commands also should trigger R2 stage, but only for last message
+                        // directly switch group if the command is in binary and the command is the last fragment (symbol == -1)
                         if ((cmd.command == OrderCommandType.BINARY_DATA_COMMAND || cmd.command == OrderCommandType.BINARY_DATA_QUERY) && cmd.symbol == -1) {
                             groupCounter++;
                             msgsInGroup = 0;
                         }
 
+                        // update command's group id
                         cmd.eventsGroup = groupCounter;
 
-
+                        // handle triggerL2DataRequest flag
                         if (triggerL2DataRequest) {
                             triggerL2DataRequest = false;
                             cmd.serviceFlags = 1;
@@ -178,12 +195,13 @@ public final class GroupingProcessor implements EventProcessor {
                             cmd.serviceFlags = 0;
                         }
 
-                        // cleaning attached events
+                        // take the attached event from the command, send to the shared pool when it is big enough, clean up the attached event from command
                         if (EVENTS_POOLING && cmd.matcherEvent != null) {
 
+                            // insert command's matcherEvent into the trade event chain and update count of event
                             // update tail
                             if (tradeEventTail == null) {
-                                tradeEventHead = cmd.matcherEvent; //?
+                                tradeEventHead = cmd.matcherEvent;
                             } else {
                                 tradeEventTail.nextEvent = cmd.matcherEvent;
                             }
@@ -223,16 +241,23 @@ public final class GroupingProcessor implements EventProcessor {
                     }
                     sequence.set(availableSequence);
                     waitSpinningHelper.signalAllWhenBlocking();
+
+                    // extend the group limit time
                     groupLastNs = System.nanoTime() + maxGroupDurationNs;
 
                 } else {
+                    // handling when next sequence is not available yet
+
+                    // check if we need to switch group
                     final long t = System.nanoTime();
+                    // if group is not empty and group limit time is exceeded, switch group
                     if (msgsInGroup > 0 && t > groupLastNs) {
-                        // switch group after T microseconds elapsed, if group is non empty
+                        // switch group after T microseconds elapsed, if group is non-empty
                         groupCounter++;
                         msgsInGroup = 0;
                     }
 
+                    // check if we need to trigger L2 data request (mark triggerL2DataRequest to true + update next l2dataLastNs)
                     if (t > l2dataLastNs) {
                         // TODO fix order best price updating mechanism,
                         //  this does not work for multi-symbol configuration
