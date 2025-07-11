@@ -84,6 +84,8 @@ public final class TwoStepSlaveProcessor implements EventProcessor {
         nextSequence = sequence.get() + 1L;
     }
 
+    // trigger by TwoStepMasterProcessor
+    // core logic will be executed in after sequence is available (base one dependency, after completion of matching engine processing)
     public void handlingCycle(final long processUpToSequence) {
         while (true) {
             OrderCommand event = null;

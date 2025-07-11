@@ -116,7 +116,10 @@ public final class TwoStepMasterProcessor implements EventProcessor {
                 final long availableSequence = waitSpinningHelper.tryWaitFor(nextSequence);
 
                 if (nextSequence <= availableSequence) {
+                    // handling when next sequence is available
                     while (nextSequence <= availableSequence) {
+
+                        // get command from ringBuffer
                         cmd = dataProvider.get(nextSequence);
 
                         // switch to next group - let slave processor start doing its handling cycle
@@ -125,6 +128,7 @@ public final class TwoStepMasterProcessor implements EventProcessor {
                             currentSequenceGroup = cmd.eventsGroup;
                         }
 
+                        // preProcess by risk engine
                         boolean forcedPublish = eventHandler.onEvent(nextSequence, cmd);
                         nextSequence++;
 
@@ -156,9 +160,14 @@ public final class TwoStepMasterProcessor implements EventProcessor {
         }
     }
 
+    // only executed when switch to next group or receive shutdown signal
     private void publishProgressAndTriggerSlaveProcessor(final long nextSequence) {
+        // sequence means the last successfully processed event
+        // we are handling nextSequence so the sequence we completed processing is nextSequence - 1
         sequence.set(nextSequence - 1);
         waitSpinningHelper.signalAllWhenBlocking();
+
+        // trigger slave processor to handle the next group of events (?)
         slaveProcessor.handlingCycle(nextSequence);
     }
 

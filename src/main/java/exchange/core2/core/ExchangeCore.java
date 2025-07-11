@@ -162,6 +162,7 @@ public final class ExchangeCore {
         final List<TwoStepMasterProcessor> procR1 = new ArrayList<>(riskEnginesNum);
         final List<TwoStepSlaveProcessor> procR2 = new ArrayList<>(riskEnginesNum);
 
+        // Step 1: group messages by GroupingProcessor
         // 1. grouping processor (G)
         final EventHandlerGroup<OrderCommand> afterGrouping =
                 disruptor.handleEventsWith((rb, bs) -> new GroupingProcessor(rb, rb.newBarrier(bs), perfCfg, coreWaitStrategy, sharedPool));
@@ -175,6 +176,7 @@ public final class ExchangeCore {
             afterGrouping.handleEventsWith(jh);
         }
 
+        // Step 2: pre-process commands in risk engines (R1)
         riskEngines.forEach((idx, riskEngine) -> afterGrouping.handleEventsWith(
                 (rb, bs) -> {
                     final TwoStepMasterProcessor r1 = new TwoStepMasterProcessor(rb, rb.newBarrier(bs), riskEngine::preProcessCommand, exceptionHandler, coreWaitStrategy, "R1_" + idx);
@@ -182,11 +184,13 @@ public final class ExchangeCore {
                     return r1;
                 }));
 
+        // Step 3: process with matching engines (ME)
         disruptor.after(procR1.toArray(new TwoStepMasterProcessor[0])).handleEventsWith(matchingEngineHandlers);
 
         // 3. risk release (R2) after matching engine (ME)
         final EventHandlerGroup<OrderCommand> afterMatchingEngine = disruptor.after(matchingEngineHandlers);
 
+        // Step 4: process risk release (R2) in parallel with results handler (E)
         riskEngines.forEach((idx, riskEngine) -> afterMatchingEngine.handleEventsWith(
                 (rb, bs) -> {
                     final TwoStepSlaveProcessor r2 = new TwoStepSlaveProcessor(rb, rb.newBarrier(bs), riskEngine::handlerRiskRelease, exceptionHandler, "R2_" + idx);
@@ -202,6 +206,7 @@ public final class ExchangeCore {
 
         final ResultsHandler resultsHandler = new ResultsHandler(resultsConsumer);
 
+        // Step 5: process result
         mainHandlerGroup.handleEventsWith((cmd, seq, eob) -> {
             resultsHandler.onEvent(cmd, seq, eob);
             api.processResult(seq, cmd); // TODO SLOW ?(volatile operations)
