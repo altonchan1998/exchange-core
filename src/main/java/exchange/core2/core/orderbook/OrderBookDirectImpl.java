@@ -39,30 +39,38 @@ import java.util.function.Supplier;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+// IOrderBook 模板​的performance向實現
+// 效能連結：使用 ART 和 Agrona/Eclipse Collections 避免標準 Java 集合的開銷，實現 O(k) 價格查找（k 為鍵長度）
 @Slf4j
 public final class OrderBookDirectImpl implements IOrderBook {
 
+    // ART 映射（鍵：價格，值：Bucket），分別儲存賣單和買單的價格層級。ART 支援高效插入/刪除/查找，優於 TreeMap 的 O(log n)
     // buckets
     private final LongAdaptiveRadixTreeMap<Bucket> askPriceBuckets;
     private final LongAdaptiveRadixTreeMap<Bucket> bidPriceBuckets;
 
+    // 交易對規格（如貨幣對、手續費），從建構子傳入
     // symbol specification
     private final CoreSymbolSpecification symbolSpec;
 
+    // ART 映射（鍵：訂單 ID，值：DirectOrder），用於快速查找訂單（O(1) 平均）
     // index: orderId -> order
     private final LongAdaptiveRadixTreeMap<DirectOrder> orderIdIndex;
     //private final Long2ObjectHashMap<DirectOrder> orderIdIndex = new Long2ObjectHashMap<>();
     //private final LongObjectHashMap<DirectOrder> orderIdIndex = new LongObjectHashMap<>();
 
+    // 最佳賣單和買單的指標（nullable），用於快速存取最佳價格，加速匹配
     // heads (nullable)
     private DirectOrder bestAskOrder = null;
     private DirectOrder bestBidOrder = null;
 
-    // Object pools
+    // 物件池，用於重用 DirectOrder 和 Bucket 物件，減少記憶體分配和 GC 暫停
     private final ObjectsPool objectsPool;
 
+    // 事件處理器，用於生成交易/拒絕事件，整合到 Disruptor 管道
     private final OrderBookEventsHelper eventsHelper;
 
+    // 是否啟用詳細日誌，從 LoggingConfiguration 獲取
     private final boolean logDebug;
 
     public OrderBookDirectImpl(final CoreSymbolSpecification symbolSpec,
@@ -84,6 +92,7 @@ public final class OrderBookDirectImpl implements IOrderBook {
                                final OrderBookEventsHelper eventsHelper,
                                final LoggingConfiguration loggingCfg) {
 
+        // 讀取 symbolSpec（透過 Chronicle-Wire 的 BytesIn）
         this.symbolSpec = new CoreSymbolSpecification(bytes);
         this.objectsPool = objectsPool;
         this.askPriceBuckets = new LongAdaptiveRadixTreeMap<>(objectsPool);
@@ -92,17 +101,20 @@ public final class OrderBookDirectImpl implements IOrderBook {
         this.orderIdIndex = new LongAdaptiveRadixTreeMap<>(objectsPool);
         this.logDebug = loggingCfg.getLoggingLevels().contains(LoggingConfiguration.LoggingLevel.LOGGING_MATCHING_DEBUG);
 
+        // 讀取訂單數量（size）
         final int size = bytes.readInt();
         for (int i = 0; i < size; i++) {
+            // 反序列化每個 DirectOrder，插入到訂單簿（insertOrder）並更新 orderIdIndex
             DirectOrder order = new DirectOrder(bytes);
             insertOrder(order, null);
             orderIdIndex.put(order.orderId, order);
         }
     }
 
+    // 核心方法：處理新訂單, 由 IOrderBook.processCommand 調用
     @Override
     public void newOrder(final OrderCommand cmd) {
-
+        // 根據訂單類型分發處理
         switch (cmd.orderType) {
             case GTC:
                 newOrderPlaceGtc(cmd);
@@ -115,6 +127,7 @@ public final class OrderBookDirectImpl implements IOrderBook {
                 break;
             // TODO IOC_BUDGET and FOK support
             default:
+                // 未支援類型記錄警告並拒絕
                 log.warn("Unsupported order type: {}", cmd);
                 eventsHelper.attachRejectEvent(cmd, cmd.size);
         }
@@ -122,18 +135,20 @@ public final class OrderBookDirectImpl implements IOrderBook {
 
 
     private void newOrderPlaceGtc(final OrderCommand cmd) {
+        // 訂單數量
         final long size = cmd.size;
 
-        // check if order is marketable there are matching orders
+        // 嘗試立即匹配，並計算已填滿的訂單數量
         final long filledSize = tryMatchInstantly(cmd, cmd);
         if (filledSize == size) {
-            // completed before being placed - can just return
+            // 如果完全填滿，直接返回
             return;
         }
 
         final long orderId = cmd.orderId;
         // TODO eliminate double hashtable lookup?
         if (orderIdIndex.get(orderId) != null) { // containsKey for hashtable
+            //　檢查訂單是否重複，若是拒絕剩餘部分並返回
             // duplicate order id - can match, but can not place
             eventsHelper.attachRejectEvent(cmd, size - filledSize);
             log.warn("duplicate order id: {}", cmd);
@@ -142,6 +157,7 @@ public final class OrderBookDirectImpl implements IOrderBook {
 
         final long price = cmd.price;
 
+        // 從物件池獲取 DirectOrder，填充欄位（ID、價格、數量等）
         // normally placing regular GTC order
         final DirectOrder orderRecord = objectsPool.get(ObjectsPool.DIRECT_ORDER, (Supplier<DirectOrder>) DirectOrder::new);
 
@@ -154,12 +170,13 @@ public final class OrderBookDirectImpl implements IOrderBook {
         orderRecord.timestamp = cmd.timestamp;
         orderRecord.filled = filledSize;
 
+        // 插入到 orderIdIndex 和訂單簿
         orderIdIndex.put(orderId, orderRecord);
         insertOrder(orderRecord, null);
     }
 
     private void newOrderMatchIoc(final OrderCommand cmd) {
-
+        // 嘗試匹配，拒絕未填滿部分 (（Immediate-or-Cancel 特性）​
         final long filledSize = tryMatchInstantly(cmd, cmd);
 
         final long rejectedSize = cmd.size - filledSize;
@@ -170,12 +187,14 @@ public final class OrderBookDirectImpl implements IOrderBook {
         }
     }
 
+    // Fill or Kill, 必須全部成交，否則全部取消
     private void newOrderMatchFokBudget(final OrderCommand cmd) {
-
+        // 計算填滿所需的預算
         final long budget = checkBudgetToFill(cmd.action, cmd.size);
 
         if (logDebug) log.debug("Budget calc: {} requested: {}", budget, cmd.price);
-
+        
+        // 檢查預算是否滿足，若是匹配，否則拒絕
         if (isBudgetLimitSatisfied(cmd.action, budget, cmd.price)) {
             tryMatchInstantly(cmd, cmd);
         } else {
@@ -218,12 +237,18 @@ public final class OrderBookDirectImpl implements IOrderBook {
         return Long.MAX_VALUE;
     }
 
-
+    // 立即匹配訂單, 返回filled size
     private long tryMatchInstantly(final IOrder takerOrder,
                                    final OrderCommand triggerCmd) {
 
         final boolean isBidAction = takerOrder.getAction() == OrderAction.BID;
 
+        // FOK_BUDGET 要求全額成交並受預算約束。賣單的預算檢查已在 newOrderMatchFokBudget 中完成，匹配過程只關心是否能全額成交，因此無需價格下限
+        // GTC：訂單可能部分匹配後放置到訂單簿，limitPrice 使用 takerOrder.getPrice() 確保匹配符合限價
+        // IOC：類似 FOK_BUDGET，但不一定有預算限制，仍然需要 limitPrice 確保匹配價格合理
+        // 賣單 vs. 買單：賣單追求最高價格，買單追求最低價格，因此賣單的 limitPrice = 0L 是特定於 FOK_BUDGET 賣單的優化
+
+        // 如果orderCommandType為PLACE_ORDER 且orderType為FOK　且為ASK action​
         final long limitPrice = (triggerCmd.command == OrderCommandType.PLACE_ORDER && triggerCmd.orderType == OrderType.FOK_BUDGET && !isBidAction)
                 ? 0L
                 : takerOrder.getPrice();
@@ -231,11 +256,15 @@ public final class OrderBookDirectImpl implements IOrderBook {
         DirectOrder makerOrder;
         if (isBidAction) {
             makerOrder = bestAskOrder;
+
+            // 如果無法匹配直接返回原本的filledSize
             if (makerOrder == null || makerOrder.price > limitPrice) {
                 return takerOrder.getFilled();
             }
         } else {
             makerOrder = bestBidOrder;
+
+            // 如果無法匹配直接返回原本的filledSize
             if (makerOrder == null || makerOrder.price < limitPrice) {
                 return takerOrder.getFilled();
             }
@@ -247,8 +276,10 @@ public final class OrderBookDirectImpl implements IOrderBook {
             return takerOrder.getFilled();
         }
 
+        // 當前價格層級的尾部訂單 (FIFO)
         DirectOrder priceBucketTail = makerOrder.parent.tail;
 
+        // 主動訂單的保留價格（用於保證金交易或快速移動訂單）
         final long takerReserveBidPrice = takerOrder.getReserveBidPrice();
 //        final long takerOrderTimestamp = takerOrder.getTimestamp();
 
@@ -262,19 +293,29 @@ public final class OrderBookDirectImpl implements IOrderBook {
 //            log.debug("  matching from maker order: {}", makerOrder);
 
             // calculate exact volume can fill for this order
+            // 計算成交量：選擇主動訂單剩餘量和被動訂單可成交量的最小值
             final long tradeSize = Math.min(remainingSize, makerOrder.size - makerOrder.filled);
 //                log.debug("  tradeSize: {} MIN(remainingSize={}, makerOrder={})", tradeSize, remainingSize, makerOrder.size - makerOrder.filled);
 
+            // DirectOrder是Order, 裡面的Bucket是Price level​
+
+            // 增加這個best marker order' filled count
             makerOrder.filled += tradeSize;
+
+            // 減少best price的trade size
             makerOrder.parent.volume -= tradeSize;
+
+            // 減少剩余需要匹配的單量
             remainingSize -= tradeSize;
 
             // remove from order book filled orders
             final boolean makerCompleted = makerOrder.size == makerOrder.filled;
             if (makerCompleted) {
+                // 如果這個maker order fully filled, 減少這個price level的單數量​
                 makerOrder.parent.numOrders--;
             }
 
+            // 建立event chain
             final MatcherTradeEvent tradeEvent = eventsHelper.sendTradeEvent(makerOrder, makerCompleted, remainingSize == 0, tradeSize,
                     isBidAction ? takerReserveBidPrice : makerOrder.reserveBidPrice);
 
@@ -285,6 +326,7 @@ public final class OrderBookDirectImpl implements IOrderBook {
             }
             eventsTail = tradeEvent;
 
+            // 如果被動訂單未完全成交，退出迴圈（因為後續訂單價格更差）
             if (!makerCompleted) {
                 // maker not completed -> no unmatched volume left, can exit matching loop
 //                    log.debug("  not completed, exit");
@@ -292,24 +334,34 @@ public final class OrderBookDirectImpl implements IOrderBook {
             }
 
             // if completed can remove maker order
+            // 移除完全成交的訂單
             orderIdIndex.remove(makerOrder.orderId);
+
+            // 回收 makerOrder 到 objectsPool
             objectsPool.put(ObjectsPool.DIRECT_ORDER, makerOrder);
 
 
+            // 如果移除的訂單是價格桶的尾部
             if (makerOrder == priceBucketTail) {
                 // reached current price tail -> remove bucket reference
                 final LongAdaptiveRadixTreeMap<Bucket> buckets = isBidAction ? askPriceBuckets : bidPriceBuckets;
+
+                // 從 ART（askPriceBuckets 或 bidPriceBuckets）移除價格層級
                 buckets.remove(makerOrder.price);
+
+                // 回收 Bucket 到 objectsPool
                 objectsPool.put(ObjectsPool.DIRECT_BUCKET, makerOrder.parent);
 //                log.debug("  removed price bucket for {}", makerOrder.price);
 
                 // set next price tail (if there is next price)
+                // 更新 priceBucketTail（若有前一個訂單）
                 if (makerOrder.prev != null) {
                     priceBucketTail = makerOrder.prev.parent.tail;
                 }
             }
 
             // switch to next order
+            // 更新Best maker order​
             makerOrder = makerOrder.prev; // can be null
 
         } while (makerOrder != null
@@ -337,7 +389,7 @@ public final class OrderBookDirectImpl implements IOrderBook {
 
     @Override
     public CommandResultCode cancelOrder(OrderCommand cmd) {
-
+        // 查找並移除訂單，生成 ReduceEvent
         // TODO avoid double lookup ?
         final DirectOrder order = orderIdIndex.get(cmd.orderId);
         if (order == null || order.uid != cmd.uid) {
